@@ -1,2 +1,151 @@
-First Commit
-Second commit Amit
+import csv
+import json
+import time
+import math
+import datetime
+import itertools
+import boto3
+from boto3.s3.transfer import S3Transfer
+
+IAM_CLIENT = boto3.client('iam')
+IAM_RESC = boto3.resource('iam')
+S3TRANSFER = S3Transfer(boto3.client('s3'))
+
+def timeit(method):
+    def timed(*args, **kw):
+        ts = time.time()
+        result = method(*args, **kw)
+        te = time.time()
+        if 'log_time' in kw:
+            name = kw.get('log_name', method.__name__.upper())
+            kw['log_time'][name] = int((te - ts) * 1000)
+        else:
+            print( '%r  %2.2f ms' % \
+                  (method.__name__, (te - ts) * 1000))
+        return result
+    return timed
+    
+def __get_instance(info, variable):
+    str_length = False
+    if isinstance(info, str):
+        var_action = info
+    elif isinstance(info.get(variable), str):
+        var_action = ''.join(list(info.get(variable)))
+    elif isinstance(info.get(variable), list):
+        var_action = ','.join(info.get(variable))
+    else:
+        var_action = info.get(variable)
+    if len(var_action) > 32750:
+        str_length = True    
+    return var_action, str_length
+
+def __write_csv(writer, role_name, create_date, role_lud, policy, policy_name, action, resource):
+    writer.writerow({'Role Name': role_name, 'Create Date':create_date, 'Last Used Date' : role_lud, 'Policy type': policy, 'Policy Name':policy_name, 'Action':action, 'Resource':resource})
+
+def writer_decider(writer, role_name, create_date, role_lud, policy, policy_name, action, resource, act_length, res_length):
+    characters = 32757
+    lower_slice = 0
+    upper_slice = characters
+    if not act_length and not res_length:
+        __write_csv(writer, role_name, create_date, role_lud, policy, policy_name, action, resource)
+    elif act_length and res_length:
+        print("Character size > 32750 (Action&Resource):", role_name)
+        if len(action) > len(resource):
+            loop = math.ceil(len(action)/upper_slice)
+        else:
+            loop = math.ceil(len(resource)/upper_slice)
+        for _ in range(loop):
+            __write_csv(writer, role_name, create_date, role_lud, policy, policy_name, action[lower_slice:upper_slice], resource[lower_slice:upper_slice])
+            lower_slice = upper_slice
+            upper_slice += characters
+    elif act_length:
+        print("Character size > 32750 (Action):", role_name)
+        loop = math.ceil(len(action)/upper_slice)
+        for _ in range(loop):
+            __write_csv(writer, role_name, create_date, role_lud, policy, policy_name, action[lower_slice:upper_slice], resource)
+            lower_slice = upper_slice
+            upper_slice += characters
+    elif res_length:
+        print("Character size > 32750 (Resource):", role_name)
+        loop = math.ceil(len(action)/upper_slice)
+        for _ in range(loop):
+            __write_csv(writer, role_name, create_date, role_lud, policy, policy_name, action, resource[lower_slice:upper_slice])
+            lower_slice = upper_slice
+            upper_slice += characters
+            
+
+
+
+def extract_action_resource(file):
+    for info in file.get('Statement'):
+        action, act_length  = __get_instance(info, 'Action')
+        resource, res_length = __get_instance(info, 'Resource')
+        yield action, resource, act_length, res_length
+        
+def create_csv(role_list, policy_list):
+    with open('/tmp/iam_automation.csv', 'w', newline='') as csvfile:
+        fieldnames = ['Role Name', 'Create Date', 'Last Used Date', 'Policy type', 'Policy Name', 'Action', 'Resource']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        role_count = 0
+        for role in role_list:
+            role_count += 1
+            role_name = role.get('RoleName')
+            role_arn = role.get('Arn')
+            create_date = role.get('CreateDate')
+            inline_policy = role.get('RolePolicyList')
+            rlu = role.get('RoleLastUsed')
+            role_lud = rlu.get('LastUsedDate')
+            policy_count = 0
+            for policy in inline_policy:
+                policy_count += 1
+                policy_name = policy.get('PolicyName')
+                for action, resource, act_length, res_length in extract_action_resource(policy.get('PolicyDocument')):
+                    writer_decider(writer, role_name, create_date, role_lud, 'Inline', policy_name, action, resource, act_length, res_length)
+            managed_policy = role.get('AttachedManagedPolicies')
+            for policy in managed_policy:
+                policy_count += 1
+                policy_name = policy.get('PolicyName')
+                policy_arn = policy.get('PolicyArn')
+                for policy_action in policy_list:
+                    if policy_name == policy_action.get('PolicyName'):
+                        for version in policy_action.get('PolicyVersionList'):
+                            for action, resource, act_length, res_length in extract_action_resource(version.get('Document')):
+                                writer_decider(writer, role_name, create_date, role_lud, 'Managed', policy_name, action, resource, act_length, res_length)
+            print(role_name, policy_count)
+    print("No of roles: ",role_count)
+
+def extract_roles_policies():
+    try:
+        marker = None
+        marker_test = True
+        role_list = []
+        policy_list = []
+        iam_list = {}
+        while marker_test:
+            if marker is None:
+                response = IAM_CLIENT.get_account_authorization_details(MaxItems=123, Filter=['Role','LocalManagedPolicy','AWSManagedPolicy'])
+            else:
+                response = IAM_CLIENT.get_account_authorization_details(MaxItems=123, Filter=['Role','LocalManagedPolicy','AWSManagedPolicy'], Marker=marker)
+            marker = response.get('Marker')
+            if marker is None:
+                marker_test = False
+            role = response.get('RoleDetailList')
+            policies = response.get('Policies')
+            if role != []:
+                role_list.append(role)
+            if policies != []:
+                policy_list.append(policies)
+        iam_list = {"Roles":role_list,"Policies":policy_list}
+        return iam_list
+    except Exception as error:
+        print(error)
+      
+@timeit
+
+def lambda_handler(event, context):
+    iam_list = extract_roles_policies()
+    role_list = list(itertools.chain(*iam_list.get('Roles')))
+    policy_list = list(itertools.chain(*iam_list.get('Policies')))
+    create_csv(role_list, policy_list)
+    S3TRANSFER.upload_file('/tmp/iam_automation.csv', 'lly-edb-raw-dev', 'sns/IAM/iam_automation.csv')
